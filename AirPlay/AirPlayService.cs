@@ -1,10 +1,12 @@
 ﻿using AirPlay.Models.Configs;
+using AirPlay.Services;
 using AirPlay.Utils;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -15,6 +17,8 @@ namespace AirPlay
         private readonly IAirPlayReceiver _airPlayReceiver;
         private readonly DumpConfig _dConfig;
 
+        private WindowsAudioOutput _audioOutput;
+        private CrossPlatformVideoManager _videoManager;
         private List<byte> _audiobuf;
 
         public AirPlayService(IAirPlayReceiver airPlayReceiver, IOptions<DumpConfig> dConfig)
@@ -49,6 +53,35 @@ namespace AirPlay
             }
 #endif
 
+            // Initialize audio and video output (Windows/Linux)
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows) || RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+            {
+                try
+                {
+                    _audioOutput = new WindowsAudioOutput();
+                    _audioOutput.Initialize();
+                    Console.WriteLine("Audio output initialized successfully");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Failed to initialize audio output: {ex.Message}");
+                }
+
+                try
+                {
+                    _videoManager = new CrossPlatformVideoManager();
+                    _videoManager.Initialize();
+                    Console.WriteLine("✓ Video output initialized successfully");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"✗ Video output disabled: {ex.Message}");
+                    _videoManager?.Dispose();
+                    _videoManager = null;
+                    Console.WriteLine("Continuing with audio-only mode...");
+                }
+            }
+
             await _airPlayReceiver.StartListeners(cancellationToken);
             await _airPlayReceiver.StartMdnsAsync().ConfigureAwait(false);
 
@@ -57,10 +90,12 @@ namespace AirPlay
                 // SET VOLUME
             };
 
-            // DUMP H264 VIDEO
+            // Process H264 video frames
             _airPlayReceiver.OnH264DataReceived += (s, e) =>
             {
-                // DO SOMETHING WITH VIDEO DATA..
+                // Render video through Windows video manager
+                _videoManager?.ProcessH264Frame(e);
+
 #if DUMP
                 using (FileStream writer = new FileStream($"{bPath}dump.h264", FileMode.Append))
                 {
@@ -70,9 +105,17 @@ namespace AirPlay
             };
 
             _audiobuf = new List<byte>();
+            var pcmReceived = false;
             _airPlayReceiver.OnPCMDataReceived += (s, e) =>
             {
-                // DO SOMETHING WITH AUDIO DATA..
+                // Play audio through Windows speakers
+                if (!pcmReceived)
+                {
+                    Console.WriteLine($"PCM data stream started (receiving {e.Length} bytes per packet)");
+                    pcmReceived = true;
+                }
+                _audioOutput?.AddSamples(e.Data, 0, e.Length);
+
 #if DUMP
                 _audiobuf.AddRange(e.Data);
 #endif
@@ -81,6 +124,13 @@ namespace AirPlay
 
         public Task StopAsync(CancellationToken cancellationToken)
         {
+            // Cleanup audio and video output
+            _audioOutput?.Dispose();
+            _audioOutput = null;
+
+            _videoManager?.Dispose();
+            _videoManager = null;
+
 #if DUMP
             // DUMP WAV AUDIO
             var bPath = _dConfig.Path;
@@ -100,7 +150,11 @@ namespace AirPlay
 
         public void Dispose()
         {
+            _audioOutput?.Dispose();
+            _audioOutput = null;
 
+            _videoManager?.Dispose();
+            _videoManager = null;
         }
     }
 }

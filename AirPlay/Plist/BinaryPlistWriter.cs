@@ -329,8 +329,10 @@ namespace System.Runtime.Serialization.Plists
             {
                 using (MemoryStream stream = new MemoryStream())
                 {
+#pragma warning disable SYSLIB0011 // BinaryFormatter is obsolete
                     BinaryFormatter formatter = new BinaryFormatter();
                     formatter.Serialize(stream, value);
+#pragma warning restore SYSLIB0011
 
                     stream.Position = 0;
                     buffer = new byte[stream.Length];

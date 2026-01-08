@@ -175,7 +175,7 @@ namespace AirPlay.Listeners
                         while ((audiobuf = RaopBufferDequeue(_raopBuffer, ref audiobuflen, ref timestamp, no_resend)) != null)
                         {
                             var pcmData = new PcmData();
-                            pcmData.Length = 960;
+                            pcmData.Length = audiobuflen; // Use actual decoded length, not hardcoded 960
                             pcmData.Data = audiobuf;
 
                             pcmData.Pts = (ulong)(timestamp - _sync_timestamp) * 1000000UL / 44100 + _sync_time;
