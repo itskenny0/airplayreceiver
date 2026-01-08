@@ -542,6 +542,10 @@ namespace AirPlay.Listeners
                 }
 
                 await session.AudioControlListener.FlushAsync(next_seq);
+
+                // Notify audio output to reset for track change
+                Console.WriteLine("Notifying audio output of flush/track change");
+                _receiver.OnAudioFlush();
             }
             if (request.Type == RequestType.TEARDOWN)
             {

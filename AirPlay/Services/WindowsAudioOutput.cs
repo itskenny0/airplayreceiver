@@ -15,7 +15,7 @@ namespace AirPlay.Services
         private Stopwatch _prebufferTimer = new Stopwatch();
         private int _bytesPerSecond;
         private int _lastBufferedBytes = 0;
-        private int _stuckBufferCount = 0;
+        private volatile bool _needsRecreation = false;
 
         public void Initialize()
         {
@@ -38,7 +38,7 @@ namespace AirPlay.Services
 
         private void CreateAudioDevice(WaveFormat waveFormat)
         {
-            // Use buffer with automatic overflow handling
+            // Use 3-second buffer for stability
             _waveProvider = new BufferedWaveProvider(waveFormat)
             {
                 BufferDuration = TimeSpan.FromSeconds(3),
@@ -46,20 +46,30 @@ namespace AirPlay.Services
                 ReadFully = false
             };
 
-            // Use WASAPI for modern Windows audio support
-            _waveOut = new WasapiOut(NAudio.CoreAudioApi.AudioClientShareMode.Shared, 200); // 200ms latency
+            // Use WaveOutEvent - most reliable for continuous streaming
+            _waveOut = new WaveOutEvent
+            {
+                DesiredLatency = 300,
+                NumberOfBuffers = 3
+            };
 
             _waveOut.PlaybackStopped += (sender, args) =>
             {
+                if (_disposed || _needsRecreation) return; // Ignore if already flagged for recreation
+
                 Console.WriteLine($"⚠ Playback stopped event fired. Exception: {args.Exception?.Message ?? "none"}");
                 if (args.Exception != null)
                 {
                     Console.WriteLine($"   Stack trace: {args.Exception.StackTrace}");
                 }
-                lock (_lock)
-                {
-                    _isPlaying = false;
-                }
+
+                // Set flag to recreate device on next AddSamples call
+                _isPlaying = false;
+                _needsRecreation = true;
+
+                var buffered = _waveProvider?.BufferedBytes ?? 0;
+                Console.WriteLine($"   Buffer at stop: {buffered} bytes ({buffered / 1024}KB)");
+                Console.WriteLine($"   Will recreate device on next audio packet");
             };
 
             _waveOut.Init(_waveProvider);
@@ -72,7 +82,40 @@ namespace AirPlay.Services
         {
             lock (_lock)
             {
-                if (_disposed || _waveProvider == null || _waveOut == null)
+                if (_disposed)
+                    return;
+
+                // Handle device recreation if PlaybackStopped was fired
+                if (_needsRecreation)
+                {
+                    Console.WriteLine("   Recreating audio device after playback stopped...");
+
+                    var oldFormat = _waveProvider?.WaveFormat ?? new WaveFormat(44100, 16, 2);
+
+                    try
+                    {
+                        _waveOut?.Dispose();
+                    }
+                    catch { }
+
+                    _waveOut = null;
+                    _waveProvider = null;
+                    _isPlaying = false;
+                    _lastBufferedBytes = 0;
+                    _sampleCount = 0; // Reset sample count for fresh start
+                    _needsRecreation = false;
+
+                    // Wait for Windows to release resources
+                    System.Threading.Thread.Sleep(150);
+
+                    // Create fresh device
+                    CreateAudioDevice(oldFormat);
+                    _prebufferTimer.Restart();
+
+                    Console.WriteLine("✓ Audio device recreated, ready for new stream");
+                }
+
+                if (_waveProvider == null || _waveOut == null)
                     return;
 
                 try
@@ -83,7 +126,7 @@ namespace AirPlay.Services
                     // Start playback after prebuffering
                     if (!_isPlaying)
                     {
-                        int prebufferBytes = _bytesPerSecond * 2; // 2 second prebuffer for stability
+                        int prebufferBytes = _bytesPerSecond * 1; // 1 second prebuffer
                         if (_waveProvider.BufferedBytes >= prebufferBytes)
                         {
                             _waveOut.Play();
@@ -95,57 +138,40 @@ namespace AirPlay.Services
                     }
                     else
                     {
-                        // Check every 1000 packets if buffer is stuck (not being consumed)
-                        if (_sampleCount % 1000 == 0)
+                        // Check if buffer is stuck (NAudio claims Playing but isn't consuming)
+                        if (_sampleCount % 500 == 0)
                         {
                             int currentBuffered = _waveProvider.BufferedBytes;
 
-                            // If buffer hasn't changed significantly and is near full, NAudio has stopped consuming
-                            if (Math.Abs(currentBuffered - _lastBufferedBytes) < _bytesPerSecond / 10 && // Less than 100ms change
-                                currentBuffered > _bytesPerSecond * 2) // More than 2 seconds buffered
+                            // If buffer is maxed out and NAudio claims it's playing, something is wrong
+                            if (currentBuffered >= _bytesPerSecond * 2.9 && // Near max (3s buffer)
+                                _waveOut.PlaybackState == PlaybackState.Playing &&
+                                currentBuffered == _lastBufferedBytes) // Buffer hasn't decreased
                             {
-                                _stuckBufferCount++;
+                                Console.WriteLine($"⚠ NAudio stuck! Buffer maxed at {currentBuffered} bytes but not consuming.");
+                                Console.WriteLine($"   Force-stopping playback to trigger recovery...");
 
-                                if (_stuckBufferCount >= 2) // Stuck for 2000 packets
+                                // Force NAudio to realize there's a problem
+                                try
                                 {
-                                    Console.WriteLine($"⚠ Buffer stuck at {currentBuffered} bytes - fully recreating audio device...");
-
-                                    // Fully dispose and recreate audio device
-                                    var waveFormat = _waveProvider.WaveFormat;
-
-                                    try
-                                    {
-                                        _waveOut.Stop();
-                                        _waveOut.Dispose();
-                                    }
-                                    catch { }
-
-                                    _waveOut = null;
-                                    _waveProvider = null;
+                                    _waveOut.Stop(); // This will trigger PlaybackStopped event
                                     _isPlaying = false;
-                                    _stuckBufferCount = 0;
-                                    _lastBufferedBytes = 0;
-
-                                    // Give Windows time to release audio device resources
-                                    System.Threading.Thread.Sleep(100);
-
-                                    // Create fresh audio device
-                                    CreateAudioDevice(waveFormat);
-                                    _prebufferTimer.Restart();
-
-                                    Console.WriteLine("✓ Audio device recreated, waiting to rebuffer...");
+                                }
+                                catch (Exception ex)
+                                {
+                                    Console.WriteLine($"   Error stopping playback: {ex.Message}");
+                                    // If stop fails, set recreation flag manually
+                                    _needsRecreation = true;
                                 }
                             }
-                            else
-                            {
-                                _stuckBufferCount = 0;
-                                _lastBufferedBytes = currentBuffered;
-                            }
 
-                            // Minimal logging - only every 5000 packets
+                            _lastBufferedBytes = currentBuffered;
+
+                            // Log status every 5000 packets
                             if (_sampleCount % 5000 == 0)
                             {
-                                Console.WriteLine($"Audio: {_sampleCount} packets | Buffer: {currentBuffered / 1024}KB | State: {_waveOut.PlaybackState}");
+                                var state = _waveOut.PlaybackState;
+                                Console.WriteLine($"Audio: {_sampleCount} packets | Buffer: {currentBuffered / 1024}KB | State: {state}");
                             }
                         }
                     }

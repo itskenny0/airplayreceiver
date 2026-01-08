@@ -90,6 +90,23 @@ namespace AirPlay
                 // SET VOLUME
             };
 
+            _airPlayReceiver.OnAudioFlushReceived += (s, e) =>
+            {
+                // Reset audio output on track change/flush
+                Console.WriteLine("Audio flush received - recreating audio output for clean state");
+                try
+                {
+                    _audioOutput?.Dispose();
+                    _audioOutput = new WindowsAudioOutput();
+                    _audioOutput.Initialize();
+                    Console.WriteLine("✓ Audio output recreated after flush");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"✗ Failed to recreate audio output: {ex.Message}");
+                }
+            };
+
             // Process H264 video frames
             _airPlayReceiver.OnH264DataReceived += (s, e) =>
             {
