@@ -20,11 +20,49 @@ namespace AirPlay
         private WindowsAudioOutput _audioOutput;
         private CrossPlatformVideoManager _videoManager;
         private List<byte> _audiobuf;
+        private readonly object _audioOutputLock = new object();
+        private volatile bool _isRecreatingAudio = false;
 
         public AirPlayService(IAirPlayReceiver airPlayReceiver, IOptions<DumpConfig> dConfig)
         {
             _airPlayReceiver = airPlayReceiver ?? throw new ArgumentNullException(nameof(airPlayReceiver));
             _dConfig = dConfig?.Value ?? throw new ArgumentNullException(nameof(dConfig));
+        }
+
+        private void RecreateAudioOutput()
+        {
+            lock (_audioOutputLock)
+            {
+                Console.WriteLine("Recreating audio output after unexpected stop...");
+                _isRecreatingAudio = true; // Drop incoming packets during recreation
+
+                try
+                {
+                    // Dispose old device
+                    _audioOutput?.Dispose();
+
+                    // CRITICAL: Wait for DirectSound to fully release COM resources
+                    // Creating a new device immediately after disposal can reuse broken internal state
+                    Console.WriteLine("Waiting 200ms for DirectSound to release resources...");
+                    Thread.Sleep(200);
+
+                    _audioOutput = new WindowsAudioOutput();
+                    _audioOutput.Initialize();
+
+                    // Subscribe to playback stopped event
+                    _audioOutput.PlaybackStoppedUnexpectedly += (s, e) => RecreateAudioOutput();
+
+                    Console.WriteLine("✓ Audio output recreated successfully");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"✗ Failed to recreate audio output: {ex.Message}");
+                }
+                finally
+                {
+                    _isRecreatingAudio = false; // Resume accepting packets
+                }
+            }
         }
 
         public async Task StartAsync(CancellationToken cancellationToken)
@@ -60,6 +98,10 @@ namespace AirPlay
                 {
                     _audioOutput = new WindowsAudioOutput();
                     _audioOutput.Initialize();
+
+                    // Subscribe to playback stopped event for automatic recreation
+                    _audioOutput.PlaybackStoppedUnexpectedly += (s, e) => RecreateAudioOutput();
+
                     Console.WriteLine("Audio output initialized successfully");
                 }
                 catch (Exception ex)
@@ -92,18 +134,14 @@ namespace AirPlay
 
             _airPlayReceiver.OnAudioFlushReceived += (s, e) =>
             {
-                // Reset audio output on track change/flush
-                Console.WriteLine("Audio flush received - recreating audio output for clean state");
-                try
+                // Track change - proactively recreate DirectSound with deferred-init pattern
+                // This treats each track change as a "mini-restart" with prebuffering
+                Console.WriteLine("Audio flush received - proactively restarting DirectSound for new track");
+
+                // Thread-safe access to audio output
+                lock (_audioOutputLock)
                 {
-                    _audioOutput?.Dispose();
-                    _audioOutput = new WindowsAudioOutput();
-                    _audioOutput.Initialize();
-                    Console.WriteLine("✓ Audio output recreated after flush");
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"✗ Failed to recreate audio output: {ex.Message}");
+                    _audioOutput?.HandleFlush();
                 }
             };
 
@@ -125,13 +163,22 @@ namespace AirPlay
             var pcmReceived = false;
             _airPlayReceiver.OnPCMDataReceived += (s, e) =>
             {
+                // Drop packets during recreation to prevent queue flooding
+                if (_isRecreatingAudio)
+                    return;
+
                 // Play audio through Windows speakers
                 if (!pcmReceived)
                 {
                     Console.WriteLine($"PCM data stream started (receiving {e.Length} bytes per packet)");
                     pcmReceived = true;
                 }
-                _audioOutput?.AddSamples(e.Data, 0, e.Length);
+
+                // Thread-safe access to audio output
+                lock (_audioOutputLock)
+                {
+                    _audioOutput?.AddSamples(e.Data, 0, e.Length);
+                }
 
 #if DUMP
                 _audiobuf.AddRange(e.Data);

@@ -274,6 +274,8 @@ namespace AirPlay.Listeners
             }
             if (request.Type == RequestType.SETUP)
             {
+                Console.WriteLine("SETUP: Processing SETUP request...");
+
                 // If session is not ready, something gone wrong.
                 if (!session.FairPlaySetupCompleted)
                 {
@@ -286,6 +288,9 @@ namespace AirPlay.Listeners
                     using (var mem = new MemoryStream(request.Body))
                     {
                         var plist = plistReader.ReadObject(mem);
+
+                        // Diagnostic: Show what's in the plist
+                        Console.WriteLine($"SETUP: plist contains streams={plist.Contains("streams")}, ekey={plist.Contains("ekey")}, eiv={plist.Contains("eiv")}");
 
                         if (plist.Contains("streams"))
                         {
@@ -441,13 +446,37 @@ namespace AirPlay.Listeners
 
                             session.StreamingListener = streaming;
                         }
-                        if (session.FairPlayReady && session.AudioSessionReady && session.AudioControlListener == null)
+                        // CRITICAL FIX: Don't wait for TEARDOWN to clean up - handle it here
+                        // This eliminates race conditions where TEARDOWN hasn't saved session yet
+                        if (session.FairPlayReady && session.AudioSessionReady)
                         {
-                            // Start 'AudioListener' (handle PCM/AAC/ALAC data received from iOS/macOS
+                            // If there's an old AudioListener, stop it first
+                            if (session.AudioControlListener != null)
+                            {
+                                Console.WriteLine("SETUP: Detected existing AudioListener, stopping it before creating new one...");
+                                try
+                                {
+                                    await session.AudioControlListener.StopAsync();
+                                }
+                                catch (Exception ex)
+                                {
+                                    Console.WriteLine($"SETUP: Error stopping old listener: {ex.Message}");
+                                }
+                                session.AudioControlListener = null;
+                                Console.WriteLine("SETUP: Old AudioListener stopped");
+                            }
+
+                            // Create new AudioListener
+                            Console.WriteLine("SETUP: Creating new AudioListener on ports 7002/7003...");
                             var control = new AudioListener(_receiver, session.SessionId, 7002, 7003, _codecConfig, _dumpConfig);
                             await control.StartAsync(cancellationToken).ConfigureAwait(false);
 
                             session.AudioControlListener = control;
+                            Console.WriteLine("SETUP: AudioListener started and ready for connections");
+                        }
+                        else
+                        {
+                            Console.WriteLine($"SETUP: Skipping AudioListener creation - FairPlayReady={session.FairPlayReady}, AudioSessionReady={session.AudioSessionReady}");
                         }
                     }
                 }
@@ -570,7 +599,12 @@ namespace AirPlay.Listeners
                         if (type == 96)
                         {
                             // Stop audio session
+                            Console.WriteLine("TEARDOWN: Stopping audio listener for track change...");
                             await session.AudioControlListener.StopAsync();
+
+                            // CRITICAL FIX: Set to null so new SETUP request creates fresh listener
+                            session.AudioControlListener = null;
+                            Console.WriteLine("TEARDOWN: Audio listener stopped and cleared for new track");
                         }
                     }
                 }

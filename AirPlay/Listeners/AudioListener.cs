@@ -36,6 +36,22 @@ namespace AirPlay.Listeners
         private readonly CodecLibrariesConfig _clConfig;
         private readonly DumpConfig _dConfig;
 
+        // Flood detection to prevent crashes from rapid packet bursts
+        private DateTime _lastPacketTime = DateTime.UtcNow;
+        private int _packetsInLastSecond = 0;
+        private DateTime _lastSecondStart = DateTime.UtcNow;
+        private const int MAX_PACKETS_PER_SECOND = 400; // v44: Increased to handle iOS bursts (typically 280-300 packets/sec)
+        private long _droppedPackets = 0;
+
+        // Back-pressure detection (v46)
+        private int _consecutiveBacklogHits = 0;
+        private DateTime _lastThrottle = DateTime.MinValue;
+
+        // Decoder corruption detection (v47)
+        private int _consecutiveEmptyFrames = 0;
+        private const int MAX_EMPTY_FRAMES = 50;
+        private AudioFormat _audioFormat;
+
         public AudioListener(IRtspReceiver receiver, string sessionId, ushort cport, ushort dport, CodecLibrariesConfig clConfig, DumpConfig dConfig) : base(cport, dport)
         {
             _receiver = receiver ?? throw new ArgumentNullException(nameof(receiver));
@@ -154,6 +170,30 @@ namespace AirPlay.Listeners
                     continue;
                 }
 
+                // FLOOD DETECTION: Prevent crash from iOS sending packets faster than real-time
+                // Track packets per second and drop excess packets
+                var now = DateTime.UtcNow;
+                if ((now - _lastSecondStart).TotalSeconds >= 1.0)
+                {
+                    // New second started
+                    if (_droppedPackets > 0)
+                    {
+                        Console.WriteLine($"AudioListener flood protection: Dropped {_droppedPackets} packets in last second (rate limiting)");
+                        _droppedPackets = 0;
+                    }
+                    _packetsInLastSecond = 0;
+                    _lastSecondStart = now;
+                }
+
+                _packetsInLastSecond++;
+
+                // If receiving more than MAX_PACKETS_PER_SECOND, drop excess packets
+                if (_packetsInLastSecond > MAX_PACKETS_PER_SECOND)
+                {
+                    _droppedPackets++;
+                    continue; // Skip processing this packet
+                }
+
                 // RTP payload type
                 int type_d = packet[1] & ~0x80;
 
@@ -169,20 +209,101 @@ namespace AirPlay.Listeners
 
                     buf_ret = RaopBufferQueue(_raopBuffer, packet, (ushort)dret, session);
 
-                    //if(_raopBuffer.LastSeqNum - _raopBuffer.FirstSeqNum > (RAOP_BUFFER_LENGTH / 8))
-                    //{
-                        // Dequeue all frames in queue
-                        while ((audiobuf = RaopBufferDequeue(_raopBuffer, ref audiobuflen, ref timestamp, no_resend)) != null)
+                    // v46 FIX: Smart throttling to handle back-pressure from full output queue
+                    // When output queue is full (500 packets), it can't accept more data
+                    // If we keep dequeuing, RaopBuffer builds up and we hit the limit continuously
+                    // Solution: Detect persistent backlog, pause dequeuing to let output drain
+                    int maxDequeue = 10;
+                    int dequeueCount = 0;
+
+                    // Check if we should throttle (pause dequeuing)
+                    bool shouldThrottle = false;
+                    var timeSinceThrottle = (DateTime.UtcNow - _lastThrottle).TotalMilliseconds;
+
+                    if (_consecutiveBacklogHits > 50 && timeSinceThrottle > 2000)
+                    {
+                        // Hit limit 50+ times AND it's been 2+ seconds since last throttle
+                        // This indicates persistent backpressure - output queue likely full
+                        Console.WriteLine($"AudioListener: Back-pressure detected ({_consecutiveBacklogHits} consecutive backlog hits), throttling for 500ms");
+                        _lastThrottle = DateTime.UtcNow;
+                        _consecutiveBacklogHits = 0;
+                        shouldThrottle = true;
+                    }
+
+                    if (!shouldThrottle)
+                    {
+                        // v48: Track attempts separately from successful dequeues to prevent throughput drops
+                        int attempts = 0;
+                        const int maxAttempts = 50;  // Prevent infinite loop if all frames are bad
+
+                        while (dequeueCount < maxDequeue && attempts < maxAttempts &&
+                               (audiobuf = RaopBufferDequeue(_raopBuffer, ref audiobuflen, ref timestamp, no_resend)) != null)
                         {
+                            attempts++;
+
+                            // v47: Detect decoder corruption - empty or zero-length buffers
+                            if (audiobuf == null || audiobuf.Length == 0 || audiobuflen <= 0)
+                            {
+                                _consecutiveEmptyFrames++;
+                                if (_consecutiveEmptyFrames % 50 == 1)
+                                {
+                                    Console.WriteLine($"AudioListener: Empty frame detected (#{_consecutiveEmptyFrames}), audiobuf.Length={audiobuf?.Length ?? -1}, audiobuflen={audiobuflen}");
+                                }
+
+                                // Reset decoder if too many consecutive empty frames
+                                if (_consecutiveEmptyFrames >= MAX_EMPTY_FRAMES)
+                                {
+                                    Console.WriteLine($"AudioListener: ⚠ DECODER CORRUPTION: {_consecutiveEmptyFrames} consecutive empty frames!");
+                                    Console.WriteLine($"AudioListener:   Resetting decoder to recover...");
+                                    ResetDecoder();
+                                    _consecutiveEmptyFrames = 0;
+                                }
+                                // v48: Don't count skipped frames toward dequeue limit - keep trying for 10 GOOD frames
+                                continue;  // Skip this frame, try next
+                            }
+
+                            // Good frame - reset empty counter
+                            if (_consecutiveEmptyFrames > 0)
+                            {
+                                Console.WriteLine($"AudioListener: ✓ Decoder recovered (good frame after {_consecutiveEmptyFrames} empty frames)");
+                                _consecutiveEmptyFrames = 0;
+                            }
+
                             var pcmData = new PcmData();
-                            pcmData.Length = audiobuflen; // Use actual decoded length, not hardcoded 960
+                            pcmData.Length = audiobuflen; // Use actual decoded length
                             pcmData.Data = audiobuf;
 
                             pcmData.Pts = (ulong)(timestamp - _sync_timestamp) * 1000000UL / 44100 + _sync_time;
 
                             _receiver.OnPCMData(pcmData);
+                            dequeueCount++;
                         }
-                    //}
+
+                        // Track consecutive backlog hits
+                        if (dequeueCount >= maxDequeue)
+                        {
+                            _consecutiveBacklogHits++;
+                            // Only log occasionally to avoid spam
+                            if (_consecutiveBacklogHits % 100 == 1)
+                            {
+                                Console.WriteLine($"AudioListener: Back-pressure building (hit limit {_consecutiveBacklogHits} times)");
+                            }
+                        }
+                        else
+                        {
+                            // Successfully drained without hitting limit, reset counter
+                            if (_consecutiveBacklogHits > 0)
+                            {
+                                Console.WriteLine($"AudioListener: Back-pressure cleared (RaopBuffer drained)");
+                                _consecutiveBacklogHits = 0;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // Throttling - skip dequeue, let RaopBuffer accumulate temporarily
+                        System.Threading.Thread.Sleep(500);
+                    }
 
                     /* Handle possible resend requests */
                     if (!no_resend)
@@ -199,7 +320,14 @@ namespace AirPlay.Listeners
 
         public Task FlushAsync(int nextSequence)
         {
+            // This is called from RTSP FLUSH handler - actual track change from iOS
+            Console.WriteLine($"FlushAsync called from RTSP FLUSH: next_seq={nextSequence}");
             RaopBufferFlush(_raopBuffer, nextSequence);
+
+            // Notify audio output of track change (only for RTSP FLUSH, not automatic buffer flushes)
+            Console.WriteLine("Notifying audio output of RTSP flush (track change)");
+            _receiver.OnAudioFlush();
+
             return Task.CompletedTask;
         }
 
@@ -408,6 +536,9 @@ namespace AirPlay.Listeners
 
         private void RaopBufferFlush(RaopBuffer raop_buffer, int next_seq)
         {
+            // Log buffer flush to distinguish between RTSP FLUSH (track change) and automatic buffer management
+            Console.WriteLine($"RaopBufferFlush: next_seq={next_seq} (clearing buffer)");
+
             int i;
             for (i = 0; i < RAOP_BUFFER_LENGTH; i++)
             {
@@ -423,6 +554,10 @@ namespace AirPlay.Listeners
                 raop_buffer.FirstSeqNum = (ushort)next_seq;
                 raop_buffer.LastSeqNum = (ushort)(next_seq - 1);
             }
+
+            // NOTE: We do NOT call _receiver.OnAudioFlush() here because this method is called for:
+            // 1. RTSP FLUSH requests (track changes) - handled by FlushAsync()
+            // 2. Automatic buffer overflows - should NOT trigger DirectSound restart
         }
 
         private void RaopBufferHandleResends(RaopBuffer raop_buffer, Socket cSocket, ushort control_seqnum)
@@ -476,8 +611,31 @@ namespace AirPlay.Listeners
             return 0;
         }
 
+        private void ResetDecoder()
+        {
+            try
+            {
+                Console.WriteLine($"AudioListener: Disposing corrupted decoder...");
+                if (_decoder is IDisposable disposable)
+                {
+                    disposable.Dispose();
+                }
+                _decoder = null;
+
+                Console.WriteLine($"AudioListener: Reinitializing decoder with format {_audioFormat}...");
+                InitializeDecoder(_audioFormat);
+
+                Console.WriteLine($"AudioListener: ✓ Decoder reset complete");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"AudioListener: ✗ Decoder reset failed: {ex.Message}");
+            }
+        }
+
         private void InitializeDecoder (AudioFormat audioFormat)
         {
+            _audioFormat = audioFormat;  // v47: Save format for potential decoder reset
             if (_decoder != null) return;
 
             if (audioFormat == AudioFormat.ALAC)
